@@ -1,1 +1,232 @@
-1
+Памятка: Terraform-модуль EKS (modules/eks-cluster)
+====================================================
+
+
+1. Структура репы
+-----------------
+
+fd_ai/
+  modules/
+    eks-cluster/          модуль EKS-кластера
+      versions.tf         версия провайдера aws (6.70.0) и provider "aws" с region = var.region
+      variables.tf        все параметры модуля с description
+      network.tf          VPC, internet gateway, публичные подсети (по одной на AZ), маршрут 0.0.0.0/0
+      iam.tf              IAM-роли кластера и нод
+      cluster.tf          aws_eks_cluster и managed node group
+      access.tf           access entries (доступ IAM-пользователей/ролей)
+      outputs.tf          имя, endpoint, регион, команда update-kubeconfig
+  1.txt                   эта памятка
+  README.md
+
+Следующий модуль кладётся рядом: modules/<имя>/ со своими versions.tf (provider внутри),
+variables.tf, outputs.tf. Вызов модуля живёт вне репы, в отдельной папке со своим state.
+
+Что создаёт модуль: VPC (по умолчанию 10.0.0.0/16), IGW, 3 публичные подсети /24 в
+ap-southeast-2a/b/c с публичными IP для нод, route table, 2 IAM-роли (<имя>-cluster,
+<имя>-node), EKS-кластер 1.37 (endpoint публичный + приватный), managed node group на
+spot (2 ноды t3.large/t3a.large/m5.large, диск 20 ГБ), access entries. NAT нет.
+Default VPC не трогается.
+
+
+2. Пример вызова: ~/tf/eks-test/main.tf
+---------------------------------------
+
+Обязательный параметр один: cluster_name. Остальные закомментированы со значениями по
+умолчанию - чтобы поменять, раскомментировать строку.
+
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "6.70.0"
+    }
+  }
+}
+
+module "eks" {
+  source = "/home/essemaks/Документы/my_git/fd_ai/modules/eks-cluster"
+
+  cluster_name = "eks-test"
+
+  # region              = "ap-southeast-2"
+  # kubernetes_version  = "1.37"
+  # vpc_cidr            = "10.0.0.0/16"
+  # availability_zones  = ["ap-southeast-2a", "ap-southeast-2b", "ap-southeast-2c"]
+  # instance_types      = ["t3.large", "t3a.large", "m5.large"]
+  # capacity_type       = "SPOT"
+  # node_desired_size   = 2
+  # node_min_size       = 2
+  # node_max_size       = 2
+  # node_disk_size      = 20
+  # public_access_cidrs = ["0.0.0.0/0"]
+  # public_access_cidrs = ["94.143.197.221/32"]
+  # tags                = {}
+
+  # access_entries = {}
+  # access_entries = {
+  #   viewer = {
+  #     principal_arn     = "arn:aws:iam::137189212633:role/eks-viewer"
+  #     kubernetes_groups = []
+  #     policies = [
+  #       { name = "AmazonEKSViewPolicy", namespaces = ["default"] },
+  #     ]
+  #   }
+  # }
+}
+
+output "cluster_name" {
+  value = module.eks.cluster_name
+}
+
+output "cluster_endpoint" {
+  value = module.eks.cluster_endpoint
+}
+
+output "region" {
+  value = module.eks.region
+}
+
+output "kubeconfig_command" {
+  value = module.eks.kubeconfig_command
+}
+
+Регион и прочие параметры задаются только в module {...}: provider "aws" находится внутри
+модуля. Несколько кластеров = несколько папок вызова (у каждой свой state) с разным
+cluster_name.
+
+
+3. Создание и удаление
+----------------------
+
+cd ~/tf/eks-test
+terraform init
+terraform validate
+terraform plan
+terraform apply                  создание ~15-20 минут
+terraform output                 имя, endpoint, команда для kubeconfig
+terraform destroy                удаление ~10-15 минут
+
+Перед destroy удалить из кластера Service типа LoadBalancer и PVC, если создавались:
+балансировщики и EBS-тома, созданные самим Kubernetes, Terraform не знает и не удалит,
+а VPC из-за них не удалится.
+
+
+4. Подключение к кластеру
+-------------------------
+
+aws eks update-kubeconfig --region ap-southeast-2 --name eks-test --alias eks-test --user-alias eks-test
+kubectl config current-context
+kubectl get nodes -o wide
+kubectl get nodes -L eks.amazonaws.com/capacityType,node.kubernetes.io/instance-type
+kubectl get pods -A
+
+update-kubeconfig переключает current-context на новый кластер. Вернуться к прежнему:
+kubectl config get-contexts
+kubectl config use-context <прежний контекст>
+
+Тестовый deployment и его удаление:
+kubectl create deployment nginx-test --image=nginx --replicas=2
+kubectl rollout status deployment/nginx-test --timeout=180s
+kubectl expose deployment nginx-test --port=80 --type=ClusterIP
+kubectl get pods,svc -l app=nginx-test -o wide
+kubectl run curl-test --rm -i --restart=Never --image=curlimages/curl -- curl -s -o /dev/null -w "%{http_code}\n" http://nginx-test.default.svc.cluster.local
+kubectl port-forward svc/nginx-test 8080:80            (в другом терминале: curl -I http://127.0.0.1:8080)
+kubectl delete service nginx-test
+kubectl delete deployment nginx-test
+
+kubectl 1.32 против кластера 1.37 - перекос больше допустимого (+-1 минор). Базовые
+команды работают, но без гарантий; лучше обновить kubectl.
+
+
+5. Как устроен доступ
+---------------------
+
+В EKS нет своих пользователей, паролей и клиентских сертификатов. Цепочка такая:
+
+  IAM-пользователь/роль -> access entry в кластере -> права:
+    а) access policy EKS (AmazonEKSClusterAdminPolicy, AmazonEKSAdminPolicy,
+       AmazonEKSEditPolicy, AmazonEKSViewPolicy) со scope на весь кластер или на
+       список namespace'ов;
+    б) и/или kubernetes_groups - имя группы, на которую вы сами делаете
+       RoleBinding/ClusterRoleBinding (обычный Kubernetes RBAC).
+
+Режим аутентификации кластера - API (только access entries, без ConfigMap aws-auth).
+Тот, кто создал кластер (здесь IAM-пользователь admin1), получает cluster-admin
+автоматически (bootstrap_cluster_creator_admin_permissions = true).
+
+Что лежит в ~/.kube/config после update-kubeconfig: адрес API, CA-сертификат кластера
+(чтобы проверять сервер) и блок exec, который при каждом запросе kubectl вызывает
+  aws eks get-token --cluster-name eks-test --region ap-southeast-2
+Сертификата и ключа пользователя там нет. Токен - это подписанный вашими AWS-ключами
+запрос sts:GetCallerIdentity, живёт ~15 минут. Кто вы - кластер узнаёт по IAM ARN.
+Отобрать доступ = удалить access entry (или права в IAM).
+
+public_access_cidrs - дополнительный слой: с каких IP вообще пускать к публичному API.
+Без IAM-токена с доступом в кластер всё равно не войти. Ноды ходят в API через
+приватный endpoint, поэтому сужение public_access_cidrs их не ломает.
+
+
+6. Пользователь/роль с ограниченными правами
+--------------------------------------------
+
+В module {...} добавить (ARN подставить свой):
+
+  access_entries = {
+    viewer = {
+      principal_arn = "arn:aws:iam::137189212633:role/eks-viewer"
+      policies = [
+        { name = "AmazonEKSViewPolicy", namespaces = ["default"] },
+      ]
+    }
+    developer = {
+      principal_arn     = "arn:aws:iam::137189212633:user/dev1"
+      kubernetes_groups = ["developers"]
+    }
+  }
+
+viewer - только чтение в namespace default. developer - права определяет ваш RBAC для
+группы developers, например:
+kubectl create rolebinding developers-edit --clusterrole=edit --group=developers --namespace=dev
+
+Подключиться под ролью отдельным контекстом и проверить права:
+aws eks update-kubeconfig --region ap-southeast-2 --name eks-test --role-arn arn:aws:iam::137189212633:role/eks-viewer --alias eks-viewer --user-alias eks-viewer
+kubectl --context eks-viewer auth can-i list pods -n default             yes
+kubectl --context eks-viewer auth can-i create deployments -n default    no
+kubectl --context eks-viewer auth can-i list pods -n kube-system         no
+
+
+7. Проверка, что после destroy ничего не осталось
+-------------------------------------------------
+
+aws eks list-clusters --region ap-southeast-2
+aws ec2 describe-instances --region ap-southeast-2 --filters Name=instance-state-name,Values=pending,running,stopping,stopped --query 'Reservations[].Instances[].[InstanceId,InstanceType,State.Name]' --output table
+aws ec2 describe-volumes --region ap-southeast-2 --query 'Volumes[].[VolumeId,Size,State]' --output table
+aws ec2 describe-network-interfaces --region ap-southeast-2 --query 'NetworkInterfaces[].[NetworkInterfaceId,VpcId,Description]' --output table
+aws ec2 describe-addresses --region ap-southeast-2 --query 'Addresses[].[PublicIp,AllocationId]' --output table
+aws ec2 describe-security-groups --region ap-southeast-2 --query "SecurityGroups[?GroupName!='default'].[GroupId,GroupName,VpcId]" --output table
+aws ec2 describe-vpcs --region ap-southeast-2 --filters Name=is-default,Values=false --query 'Vpcs[].[VpcId,CidrBlock]' --output table
+aws elbv2 describe-load-balancers --region ap-southeast-2 --query 'LoadBalancers[].LoadBalancerName' --output table
+aws iam list-roles --query "Roles[?starts_with(RoleName, 'eks-test')].RoleName" --output table
+aws logs describe-log-groups --region ap-southeast-2 --log-group-name-prefix /aws/eks/eks-test --query 'logGroups[].logGroupName' --output table
+
+Ожидаемо: все списки пустые (default VPC и default SG отфильтрованы).
+
+Убрать контексты теста из ~/.kube/config (имена из --alias/--user-alias выше,
+кластер записан под своим ARN):
+kubectl config get-contexts
+kubectl config delete-context eks-test
+kubectl config delete-user eks-test
+kubectl config delete-cluster arn:aws:eks:ap-southeast-2:137189212633:cluster/eks-test
+
+
+8. Стоимость (ap-southeast-2, цены на 2026-10-27)
+--------------------------------------------------
+
+Control plane EKS                      $0.10/ч        (AWS Price List API, AmazonEKS perCluster)
+2 spot-ноды t3.large/t3a.large/m5.large ~$0.036-0.049/ч за ноду (aws ec2 describe-spot-price-history)
+2 публичных IPv4 на нодах              $0.005/ч за адрес (AWS Price List API, PublicIPv4)
+2 x 20 ГБ EBS (корневые диски нод)   gp3 $0.096/ГБ-мес, ~ $0.005/ч на оба
+Итого                                  ~ $0.19-0.22/ч, ~ $5/сутки
+
+Страницы цен: https://aws.amazon.com/eks/pricing/ , https://aws.amazon.com/ec2/spot/pricing/ ,
+https://aws.amazon.com/vpc/pricing/ , https://aws.amazon.com/ebs/pricing/
